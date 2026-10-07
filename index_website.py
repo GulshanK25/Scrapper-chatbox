@@ -1,6 +1,6 @@
 from scrapper.crawler import crawl_website
 from RAG.chunker import chunk_pages
-from RAG.vector_store import VectorStore
+from RAG.Vectorstore import VectorStore
 
 
 website = input(

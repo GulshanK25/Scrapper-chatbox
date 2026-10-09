@@ -1,10 +1,11 @@
+
 import streamlit as st
 from urllib.parse import urlparse
 
 from scrapper.crawler import crawl_website
 from RAG.chunker import chunk_pages
 from RAG.Vectorstore import VectorStore
-from RAG.generator import Generator
+from RAG.graph import RAGGraph
 
 
 st.set_page_config(
@@ -17,19 +18,19 @@ st.title("🔎 Website RAG Assistant")
 
 st.write(
     "Enter a website, index its content, and ask questions "
-    "using a fully local RAG pipeline powered by Llama 3."
+    "using a fully local LangGraph-powered RAG pipeline with Llama 3."
 )
 
 
 @st.cache_resource
 def load_system():
     vector_store = VectorStore()
-    generator = Generator()
+    rag_graph = RAGGraph()
 
-    return vector_store, generator
+    return vector_store, rag_graph
 
 
-vector_store, generator = load_system()
+vector_store, rag_graph = load_system()
 
 
 # -----------------------------
@@ -180,57 +181,50 @@ if st.button("Ask Question"):
 
     else:
 
-        with st.spinner(
-            "Searching website..."
-        ):
+        try:
 
-            results = vector_store.search(
-                question,
-                top_k=3,
-                domain=selected_domain,
+            with st.spinner(
+                "Searching website and generating answer..."
+            ):
+
+                result = rag_graph.ask(
+                    question=question,
+                    domain=selected_domain,
+                )
+
+            answer = result["answer"]
+            context = result["context"]
+
+            st.subheader("Answer")
+            st.write(answer)
+
+            not_found = (
+                "I could not find this "
+                "information on the website."
             )
 
-            if not results:
+            if (
+                context
+                and not_found.lower()
+                not in answer.lower()
+            ):
 
-                st.warning(
-                    "No relevant information was found."
-                )
+                st.subheader("Sources")
 
-            else:
+                sources = []
 
-                answer = generator.generate(
-                    question,
-                    results,
-                )
+                for chunk in context:
 
-                st.subheader("Answer")
+                    source = chunk["source"]
 
-                st.write(answer)
+                    if source not in sources:
+                        sources.append(source)
 
-                not_found = (
-                    "I could not find this "
-                    "information on the website."
-                )
+                for source in sources:
+                    st.write(source)
 
-                if (
-                    not_found.lower()
-                    not in answer.lower()
-                ):
+        except Exception as error:
 
-                    st.subheader("Sources")
-
-                    sources = []
-
-                    for result in results:
-
-                        source = result[
-                            "source"
-                        ]
-
-                        if source not in sources:
-                            sources.append(
-                                source
-                            )
-
-                    for source in sources:
-                        st.write(source)
+            st.error(
+                f"Question answering failed: {error}"
+            )

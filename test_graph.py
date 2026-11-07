@@ -1,24 +1,31 @@
-from RAG.graph import RAGGraph
 
+from RAG.graph import RAGGraph
 
 rag = RAGGraph()
 
-result = rag.ask(
-    question="How do I define a function in Python?",
-    domain="docs.python.org",
-)
+tests = [
+    "How do I define a function in Python?",
+    "Who is the president of France?",
+]
 
-print("\nANSWER:")
-print(result["answer"])
+for question in tests:
+    print("\n" + "=" * 60)
+    print("QUESTION:", question)
 
-print("\nSOURCES:")
-
-sources = set()
-
-for chunk in result["context"]:
-    sources.add(
-        chunk["source"]
+    result = rag.ask(
+        question=question,
+        domain="docs.python.org",
     )
 
-for source in sources:
-    print(source)
+    print("RELEVANCE:", result["relevance"])
+    print("RETRIES:", result["retry_count"])
+    print("SEARCH QUERY:", result["search_query"])
+    print("ANSWER:", result["answer"])
+
+    if result["relevance"] == "yes":
+        print("SOURCES:")
+        for source in sorted({
+            chunk["source"]
+            for chunk in result["context"]
+        }):
+            print(source)

@@ -1,186 +1,596 @@
-from urllib.parse import urljoin, urlparse, urldefrag
+
+from collections import deque
+from urllib.parse import (
+    urljoin,
+    urlparse,
+    urlunparse,
+    parse_qsl,
+    urlencode,
+)
+from urllib.robotparser import RobotFileParser
+import gzip
+import logging
+import time
+import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
 
 
+logger = logging.getLogger(__name__)
+
+USER_AGENT = "WebsiteRAGBot/1.0"
+
 HEADERS = {
-    "User-Agent": "WebsiteRAGBot/1.0"
+    "User-Agent": USER_AGENT
 }
 
 IGNORED_EXTENSIONS = (
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".svg",
-    ".webp",
-    ".pdf",
-    ".zip",
-    ".css",
-    ".js",
-    ".xml",
-    
+    ".jpg", ".jpeg", ".png", ".gif",
+    ".svg", ".webp", ".pdf", ".zip",
+    ".css", ".js", ".xml", ".json",
+    ".ico", ".mp4", ".mp3",
+    ".woff", ".woff2", ".ttf", ".gz",
 )
-IGNORED_PATHS = (
-    "/genindex.html",
-    "/py-modindex.html",
-    "/search.html",
+
+IGNORED_FILENAMES = {
+    "search.html",
+    "genindex.html",
+    "py-modindex.html",
+    "copyright.html",
+    "bugs.html",
+    "improve-page-nojs.html",
+}
+
+TRACKING_PARAMS = {
+    "fbclid", "gclid", "mc_cid", "mc_eid"
+}
+
+# Python documentation pages we want first.
+PYTHON_PRIORITY_PATHS = (
+    "/3/reference/",
+    "/3/library/",
+    "/3/tutorial/",
+    "/3/glossary.html",
 )
 
 
 def normalize_url(url: str) -> str:
-    """Remove URL fragments."""
+    parsed = urlparse(url.strip())
 
-    url, _ = urldefrag(url)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
 
-    return url
+    if not hostname:
+        return url.split("#", 1)[0]
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return url
+
+    netloc = hostname
+
+    if port and not (
+        (scheme == "https" and port == 443)
+        or (scheme == "http" and port == 80)
+    ):
+        netloc = f"{hostname}:{port}"
+
+    params = [
+        (key, value)
+        for key, value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        )
+        if not key.lower().startswith("utm_")
+        and key.lower() not in TRACKING_PARAMS
+    ]
+
+    return urlunparse((
+        scheme,
+        netloc,
+        parsed.path or "/",
+        "",
+        urlencode(sorted(params)),
+        "",
+    ))
 
 
 def is_valid_page(url: str) -> bool:
-    """Return False for URLs that we don't want to scrape."""
-
     parsed = urlparse(url)
 
-    if parsed.scheme not in ("http", "https"):
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         return False
 
     path = parsed.path.lower()
 
-    if path.endswith(IGNORED_EXTENSIONS):
+    filename = path.rsplit("/", 1)[-1]
+
+    if filename in IGNORED_FILENAMES:
         return False
 
-    if path.endswith(IGNORED_PATHS):
+    return not path.endswith(IGNORED_EXTENSIONS)
+
+
+def get_scope(start_url: str):
+    parsed = urlparse(start_url)
+    path = parsed.path or "/"
+
+    if path.endswith("/"):
+        base_path = path
+    else:
+        base_path = path.rsplit("/", 1)[0] + "/"
+
+    return parsed.netloc.lower(), base_path
+
+
+def get_website_root(start_url: str) -> str:
+    """
+    Determine a sensible website-wide root.
+
+    Python docs:
+        /3/tutorial/ -> /3/
+
+    General websites:
+        /blog/article/ -> /
+    """
+    parsed = urlparse(start_url)
+
+    if parsed.hostname == "docs.python.org":
+        parts = parsed.path.strip("/").split("/")
+
+        if parts and parts[0] == "3":
+            return "/3/"
+
+    return "/"
+
+
+def allowed_url(
+    url: str,
+    domain: str,
+    base_path: str,
+    scope: str = "section",
+    website_root: str = "/",
+) -> bool:
+
+    parsed = urlparse(url)
+
+    if not is_valid_page(url):
         return False
 
-    return True
+    if parsed.netloc.lower() != domain.lower():
+        return False
 
-def scrape_page(url: str) -> tuple[str, list[str]]:
-    """Download a webpage and return its text and links."""
+    if scope == "section":
+        return parsed.path.startswith(base_path)
 
-    response = requests.get(
+    if scope == "website":
+        return parsed.path.startswith(website_root)
+
+    return False
+
+
+def url_priority(url: str) -> int:
+    """
+    Lower score = higher priority.
+
+    This prioritization is specific to Python docs.
+    Other websites use a neutral priority.
+    """
+    parsed = urlparse(url)
+
+    if parsed.hostname != "docs.python.org":
+        return 10
+
+    path = parsed.path
+
+    # Glossary is useful for terminology.
+    if path == "/3/glossary.html":
+        return 0
+
+    # Detailed language documentation.
+    if path.startswith("/3/reference/"):
+        return 1
+
+    # Standard library documentation.
+    if path.startswith("/3/library/"):
+        return 2
+
+    # Python tutorial.
+    if path.startswith("/3/tutorial/"):
+        return 3
+
+    return 10
+
+
+def load_robots(session, start_url):
+    parsed = urlparse(start_url)
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    robots_url = origin + "/robots.txt"
+
+    parser = RobotFileParser()
+    parser.set_url(robots_url)
+
+    try:
+        response = session.get(
+            robots_url,
+            timeout=10,
+            allow_redirects=False,
+        )
+
+        if response.status_code == 404:
+            parser.parse([])
+            return parser, []
+
+        response.raise_for_status()
+
+        parser.parse(response.text.splitlines())
+
+        sitemaps = []
+
+        for line in response.text.splitlines():
+            if line.lower().startswith("sitemap:"):
+                sitemaps.append(
+                    line.split(":", 1)[1].strip()
+                )
+
+        return parser, sitemaps
+
+    except requests.RequestException as error:
+        logger.warning(
+            "Could not verify robots.txt: %s",
+            error,
+        )
+        return None, []
+
+
+def discover_sitemap_urls(
+    session,
+    sitemap_url,
+    origin,
+    robots,
+    max_sitemaps=30,
+    max_urls=10000,
+):
+    pending = deque([sitemap_url])
+    visited = set()
+    discovered = 0
+
+    while pending and len(visited) < max_sitemaps:
+
+        current = normalize_url(pending.popleft())
+
+        if current in visited:
+            continue
+
+        if urlparse(current).netloc != urlparse(origin).netloc:
+            continue
+
+        if not robots.can_fetch(USER_AGENT, current):
+            continue
+
+        visited.add(current)
+
+        try:
+            response = session.get(
+                current,
+                timeout=15,
+                allow_redirects=False,
+            )
+
+            if response.is_redirect:
+                continue
+
+            response.raise_for_status()
+
+            if len(response.content) > 5_000_000:
+                continue
+
+            raw = response.content
+
+            if current.endswith(".gz"):
+                raw = gzip.decompress(raw)
+
+                if len(raw) > 10_000_000:
+                    continue
+
+            root = ET.fromstring(raw)
+
+        except (
+            requests.RequestException,
+            ET.ParseError,
+            OSError,
+            ValueError,
+        ):
+            continue
+
+        root_type = root.tag.rsplit("}", 1)[-1]
+
+        if root_type == "sitemapindex":
+
+            for node in root:
+                if node.tag.rsplit("}", 1)[-1] != "sitemap":
+                    continue
+
+                for child in node:
+                    if (
+                        child.tag.rsplit("}", 1)[-1] == "loc"
+                        and child.text
+                    ):
+                        pending.append(child.text.strip())
+
+        elif root_type == "urlset":
+
+            for node in root:
+                if node.tag.rsplit("}", 1)[-1] != "url":
+                    continue
+
+                for child in node:
+                    if (
+                        child.tag.rsplit("}", 1)[-1] == "loc"
+                        and child.text
+                    ):
+                        yield normalize_url(
+                            child.text.strip()
+                        )
+
+                        discovered += 1
+
+                        if discovered >= max_urls:
+                            return
+
+
+def fetch_page(session, url):
+    response = session.get(
         url,
-        timeout=10,
-        headers=HEADERS,
+        timeout=15,
+        allow_redirects=False,
     )
+
+    if response.is_redirect:
+        return "", []
 
     response.raise_for_status()
 
-    content_type = response.headers.get("Content-Type", "")
+    content_type = response.headers.get(
+        "Content-Type", ""
+    ).lower()
 
     if "text/html" not in content_type:
         return "", []
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    if len(response.content) > 5_000_000:
+        return "", []
 
-    # Remove elements that aren't useful knowledge.
-    for element in soup(
-        ["script", "style", "noscript"]
-    ):
-        element.decompose()
-
-    text = soup.get_text(
-        separator=" ",
-        strip=True,
+    soup = BeautifulSoup(
+        response.content,
+        "html.parser",
     )
 
     links = []
 
+    # Collect links before removing navigation.
     for tag in soup.find_all("a", href=True):
 
-        absolute_url = urljoin(
-            url,
-            tag["href"],
+        link = normalize_url(
+            urljoin(url, tag["href"])
         )
 
-        absolute_url = normalize_url(
-            absolute_url
-        )
+        if is_valid_page(link):
+            links.append(link)
 
-        if is_valid_page(absolute_url):
-            links.append(absolute_url)
+    for element in soup([
+        "script", "style", "noscript",
+        "nav", "footer", "header",
+    ]):
+        element.decompose()
+
+    main = (
+        soup.find("main")
+        or soup.find("article")
+        or soup.body
+        or soup
+    )
+
+    text = main.get_text(
+        separator=" ",
+        strip=True,
+    )
 
     return text, links
 
 
-def allowed_url(url: str, domain: str, base_path: str) -> bool:
+def scrape_page(url: str):
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+        return fetch_page(
+            session,
+            normalize_url(url),
+        )
+
+
+def iter_website_pages(
+    start_url: str,
+    max_pages: int = 100,
+    delay: float = 0.5,
+    scope: str = "section",
+):
     """
-    Check whether the URL belongs to the same website
-    and stays inside the starting section.
+    Crawl pages incrementally.
+
+    section:
+        Only the starting section.
+
+    website:
+        Explore the website within a sensible root.
+
+    URLs are prioritized by documentation relevance.
     """
 
-    parsed = urlparse(url)
+    if scope not in ("section", "website"):
+        raise ValueError(
+            "scope must be 'section' or 'website'"
+        )
 
-    if parsed.netloc != domain:
-        return False
+    if max_pages < 1 or delay < 0:
+        raise ValueError("Invalid crawl settings")
 
-    return parsed.path.startswith(base_path)
+    start_url = normalize_url(start_url)
+
+    if not is_valid_page(start_url):
+        raise ValueError("Invalid starting URL")
+
+    domain, base_path = get_scope(start_url)
+
+    website_root = get_website_root(start_url)
+
+    parsed = urlparse(start_url)
+
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Priority queues for discovered URLs.
+    queues = {
+        priority: deque()
+        for priority in range(11)
+    }
+
+    queued = set()
+    visited = set()
+
+    queue_limit = max(1000, max_pages * 3)
+
+    def enqueue(url):
+        url = normalize_url(url)
+
+        if url in queued or url in visited:
+            return
+
+        if not allowed_url(
+            url,
+            domain,
+            base_path,
+            scope,
+            website_root,
+        ):
+            return
+
+        if len(queued) >= queue_limit:
+            return
+
+        priority = url_priority(url)
+
+        queues[priority].append(url)
+        queued.add(url)
+
+    enqueue(start_url)
+
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+
+        robots, sitemaps = load_robots(
+            session,
+            start_url,
+        )
+
+        if robots is None:
+            logger.warning(
+                "Crawl stopped: robots.txt unavailable"
+            )
+            return
+
+        sitemaps.append(origin + "/sitemap.xml")
+
+        for sitemap in dict.fromkeys(sitemaps):
+
+            for link in discover_sitemap_urls(
+                session,
+                sitemap,
+                origin,
+                robots,
+                max_urls=queue_limit,
+            ):
+                enqueue(link)
+
+            if len(queued) >= queue_limit:
+                break
+
+        pages_crawled = 0
+        last_request = 0.0
+
+        while pages_crawled < max_pages:
+
+            url = None
+
+            for priority in sorted(queues):
+                if queues[priority]:
+                    url = queues[priority].popleft()
+                    break
+
+            if url is None:
+                break
+
+            if url in visited:
+                continue
+
+            visited.add(url)
+
+            if not robots.can_fetch(
+                USER_AGENT,
+                url,
+            ):
+                continue
+
+            wait = delay - (
+                time.monotonic() - last_request
+            )
+
+            if wait > 0:
+                time.sleep(wait)
+
+            last_request = time.monotonic()
+
+            try:
+                text, links = fetch_page(
+                    session,
+                    url,
+                )
+
+            except requests.RequestException as error:
+                logger.warning(
+                    "Failed to crawl %s: %s",
+                    url,
+                    error,
+                )
+                continue
+
+            if text:
+                pages_crawled += 1
+
+                yield {
+                    "url": url,
+                    "text": text,
+                }
+
+            for link in links:
+                enqueue(link)
+
 
 def crawl_website(
     start_url: str,
     max_pages: int = 10,
+    scope: str = "section",
 ):
-    """Crawl pages belonging to one website."""
-
-    start_url = normalize_url(start_url)
-
-    domain = urlparse(start_url).netloc 
-    
-    base_path = urlparse(start_url).path
-    
-    if not base_path.endswith("/"):
-         base_path = base_path.rsplit("/", 1)[0] + "/"
-
-    pages_to_visit = [start_url]
-
-    queued = {start_url}
-
-    visited = set()
-
-    pages = []
-
-    while (
-        pages_to_visit
-        and len(visited) < max_pages
-    ):
-
-        url = pages_to_visit.pop(0)
-
-        if url in visited:
-            continue
-
-        print(f"Scraping: {url}")
-
-        try:
-
-            text, links = scrape_page(url)
-
-            visited.add(url)
-
-            if text:
-
-                pages.append(
-                    {
-                        "url": url,
-                        "text": text,
-                    }
-                )
-
-            for link in links:
-
-                if (
-                    allowed_url(link, domain, base_path)
-                    and link not in visited
-                    and link not in queued
-                ):
-
-                    pages_to_visit.append(link)
-                    queued.add(link)
-
-        except requests.RequestException as error:
-
-            print(
-                f"Could not scrape {url}: {error}"
-            )
-
-    return pages
+    return list(
+        iter_website_pages(
+            start_url,
+            max_pages=max_pages,
+            scope=scope,
+        )
+    )

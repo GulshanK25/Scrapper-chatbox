@@ -8,6 +8,7 @@ from urllib.parse import (
     urlencode,
 )
 from urllib.robotparser import RobotFileParser
+
 import gzip
 import logging
 import time
@@ -15,6 +16,7 @@ import xml.etree.ElementTree as ET
 
 import requests
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +24,7 @@ logger = logging.getLogger(__name__)
 USER_AGENT = "WebsiteRAGBot/1.0"
 
 HEADERS = {
-    "User-Agent": USER_AGENT
+    "User-Agent": USER_AGENT,
 }
 
 IGNORED_EXTENSIONS = (
@@ -43,17 +45,13 @@ IGNORED_FILENAMES = {
 }
 
 TRACKING_PARAMS = {
-    "fbclid", "gclid", "mc_cid", "mc_eid"
+    "fbclid", "gclid", "mc_cid", "mc_eid",
 }
 
-# Python documentation pages we want first.
-PYTHON_PRIORITY_PATHS = (
-    "/3/reference/",
-    "/3/library/",
-    "/3/tutorial/",
-    "/3/glossary.html",
-)
 
+# =========================================================
+# URL UTILITIES
+# =========================================================
 
 def normalize_url(url: str) -> str:
     parsed = urlparse(url.strip())
@@ -109,7 +107,6 @@ def is_valid_page(url: str) -> bool:
         return False
 
     path = parsed.path.lower()
-
     filename = path.rsplit("/", 1)[-1]
 
     if filename in IGNORED_FILENAMES:
@@ -132,14 +129,15 @@ def get_scope(start_url: str):
 
 def get_website_root(start_url: str) -> str:
     """
-    Determine a sensible website-wide root.
+    Determine a suitable website-wide root.
 
-    Python docs:
+    Python documentation:
         /3/tutorial/ -> /3/
 
-    General websites:
+    Other websites:
         /blog/article/ -> /
     """
+
     parsed = urlparse(start_url)
 
     if parsed.hostname == "docs.python.org":
@@ -158,7 +156,6 @@ def allowed_url(
     scope: str = "section",
     website_root: str = "/",
 ) -> bool:
-
     parsed = urlparse(url)
 
     if not is_valid_page(url):
@@ -178,11 +175,9 @@ def allowed_url(
 
 def url_priority(url: str) -> int:
     """
-    Lower score = higher priority.
-
-    This prioritization is specific to Python docs.
-    Other websites use a neutral priority.
+    Lower score means higher crawling priority.
     """
+
     parsed = urlparse(url)
 
     if parsed.hostname != "docs.python.org":
@@ -190,24 +185,24 @@ def url_priority(url: str) -> int:
 
     path = parsed.path
 
-    # Glossary is useful for terminology.
     if path == "/3/glossary.html":
         return 0
 
-    # Detailed language documentation.
     if path.startswith("/3/reference/"):
         return 1
 
-    # Standard library documentation.
     if path.startswith("/3/library/"):
         return 2
 
-    # Python tutorial.
     if path.startswith("/3/tutorial/"):
         return 3
 
     return 10
 
+
+# =========================================================
+# ROBOTS.TXT
+# =========================================================
 
 def load_robots(session, start_url):
     parsed = urlparse(start_url)
@@ -229,8 +224,14 @@ def load_robots(session, start_url):
             parser.parse([])
             return parser, []
 
-        response.raise_for_status()
+        if response.is_redirect:
+            logger.warning(
+                "robots.txt redirected: %s",
+                robots_url,
+            )
+            return None, []
 
+        response.raise_for_status()
         parser.parse(response.text.splitlines())
 
         sitemaps = []
@@ -251,6 +252,10 @@ def load_robots(session, start_url):
         return None, []
 
 
+# =========================================================
+# SITEMAP DISCOVERY
+# =========================================================
+
 def discover_sitemap_urls(
     session,
     sitemap_url,
@@ -264,7 +269,6 @@ def discover_sitemap_urls(
     discovered = 0
 
     while pending and len(visited) < max_sitemaps:
-
         current = normalize_url(pending.popleft())
 
         if current in visited:
@@ -314,7 +318,6 @@ def discover_sitemap_urls(
         root_type = root.tag.rsplit("}", 1)[-1]
 
         if root_type == "sitemapindex":
-
             for node in root:
                 if node.tag.rsplit("}", 1)[-1] != "sitemap":
                     continue
@@ -327,7 +330,6 @@ def discover_sitemap_urls(
                         pending.append(child.text.strip())
 
         elif root_type == "urlset":
-
             for node in root:
                 if node.tag.rsplit("}", 1)[-1] != "url":
                     continue
@@ -347,7 +349,194 @@ def discover_sitemap_urls(
                             return
 
 
+# =========================================================
+# STRUCTURED HTML EXTRACTION
+# =========================================================
+
+def extract_structured_content(soup):
+    """
+    Extract readable page content while preserving:
+
+    - Headings
+    - Paragraphs
+    - Glossary terms and definitions
+    - Lists
+    - Syntax-highlighted code blocks
+
+    Removes common navigation and UI elements.
+    """
+
+    main = (
+        soup.select_one('[role="main"]')
+        or soup.find("main")
+        or soup.find("article")
+        or soup.body
+        or soup
+    )
+
+    # Copy the selected content so the original
+    # BeautifulSoup document remains unchanged.
+    content = BeautifulSoup(
+        str(main),
+        "html.parser",
+    )
+
+    for element in content.select(
+        "nav, footer, header, script, style, "
+        "noscript, aside, .sidebar, .sphinxsidebar, "
+        ".related, .toctree-wrapper, "
+        ".headerlink, .viewcode-link, "
+        ".mobile-nav, .search, "
+        '[role="navigation"], '
+        '[role="search"], '
+        '.copybtn, .copybutton'
+    ):
+        element.decompose()
+
+    blocks = []
+
+    def clean_text(element):
+        return element.get_text(
+            " ",
+            strip=True,
+        )
+
+    def add_block(text):
+        text = text.strip()
+
+        if text:
+            blocks.append(text)
+
+    def render_code(element):
+        """
+        Preserve original whitespace inside <pre>.
+
+        Syntax highlighting commonly uses nested spans.
+        An empty separator avoids adding unwanted
+        spaces or line breaks between code tokens.
+        """
+        code = element.get_text(
+            separator="",
+            strip=False,
+        ).strip("\n")
+
+        if code.strip():
+            add_block(
+                "```\n" + code + "\n```"
+            )
+
+    def walk(element):
+        """
+        Recursively process content in document order.
+
+        This preserves code inside definition lists
+        instead of flattening entire definitions.
+        """
+
+        if not isinstance(element, Tag):
+            return
+
+        tag = element.name
+
+        if tag in {
+            "script", "style", "noscript",
+        }:
+            return
+
+        if tag in {
+            "h1", "h2", "h3",
+            "h4", "h5", "h6",
+        }:
+            level = int(tag[1])
+            heading = clean_text(element)
+
+            if heading:
+                add_block(
+                    "#" * level + " " + heading
+                )
+            return
+
+        if tag == "pre":
+            render_code(element)
+            return
+
+        if tag == "dt":
+            term = clean_text(element)
+
+            if term:
+                add_block("### " + term)
+            return
+
+        if tag == "p":
+            paragraph = clean_text(element)
+            add_block(paragraph)
+            return
+
+        if tag == "li":
+            # Capture list item text without
+            # flattening nested code blocks.
+            direct_parts = []
+
+            for child in element.children:
+                if isinstance(child, Tag):
+                    if child.name in {
+                        "ul", "ol", "pre",
+                        "div", "dl",
+                    }:
+                        continue
+
+                    direct_parts.append(
+                        clean_text(child)
+                    )
+                else:
+                    direct_parts.append(str(child))
+
+            item = " ".join(
+                part.strip()
+                for part in direct_parts
+                if part.strip()
+            )
+
+            if item:
+                add_block("- " + item)
+
+            for child in element.children:
+                if isinstance(child, Tag):
+                    if child.name in {
+                        "ul", "ol", "pre",
+                        "div", "dl",
+                    }:
+                        walk(child)
+
+            return
+
+        if tag in {"dd", "div", "section", "article",
+                   "main", "body", "dl", "ul", "ol"}:
+            for child in element.children:
+                walk(child)
+            return
+
+        # Generic container fallback.
+        for child in element.children:
+            walk(child)
+
+    walk(content)
+
+    return "\n\n".join(blocks)
+
+
+# =========================================================
+# PAGE FETCHING
+# =========================================================
+
 def fetch_page(session, url):
+    """
+    Fetch one HTML page and extract structured content.
+
+    Returns:
+        (text, links)
+    """
+
     response = session.get(
         url,
         timeout=15,
@@ -376,9 +565,8 @@ def fetch_page(session, url):
 
     links = []
 
-    # Collect links before removing navigation.
+    # Discover links before cleaning the HTML.
     for tag in soup.find_all("a", href=True):
-
         link = normalize_url(
             urljoin(url, tag["href"])
         )
@@ -386,35 +574,28 @@ def fetch_page(session, url):
         if is_valid_page(link):
             links.append(link)
 
-    for element in soup([
-        "script", "style", "noscript",
-        "nav", "footer", "header",
-    ]):
-        element.decompose()
-
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.body
-        or soup
-    )
-
-    text = main.get_text(
-        separator=" ",
-        strip=True,
-    )
+    text = extract_structured_content(soup)
 
     return text, links
 
 
 def scrape_page(url: str):
+    """
+    Scrape one page without following links.
+    """
+
     with requests.Session() as session:
         session.headers.update(HEADERS)
+
         return fetch_page(
             session,
             normalize_url(url),
         )
 
+
+# =========================================================
+# WEBSITE CRAWLING
+# =========================================================
 
 def iter_website_pages(
     start_url: str,
@@ -426,12 +607,12 @@ def iter_website_pages(
     Crawl pages incrementally.
 
     section:
-        Only the starting section.
+        Crawl within the starting section.
 
     website:
-        Explore the website within a sensible root.
+        Crawl within the website root.
 
-    URLs are prioritized by documentation relevance.
+    Uses URL prioritization and respects robots.txt.
     """
 
     if scope not in ("section", "website"):
@@ -448,14 +629,11 @@ def iter_website_pages(
         raise ValueError("Invalid starting URL")
 
     domain, base_path = get_scope(start_url)
-
     website_root = get_website_root(start_url)
 
     parsed = urlparse(start_url)
-
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    # Priority queues for discovered URLs.
     queues = {
         priority: deque()
         for priority in range(11)
@@ -508,7 +686,6 @@ def iter_website_pages(
         sitemaps.append(origin + "/sitemap.xml")
 
         for sitemap in dict.fromkeys(sitemaps):
-
             for link in discover_sitemap_urls(
                 session,
                 sitemap,
@@ -525,7 +702,6 @@ def iter_website_pages(
         last_request = 0.0
 
         while pages_crawled < max_pages:
-
             url = None
 
             for priority in sorted(queues):
@@ -587,6 +763,10 @@ def crawl_website(
     max_pages: int = 10,
     scope: str = "section",
 ):
+    """
+    Crawl a website and return the collected pages.
+    """
+
     return list(
         iter_website_pages(
             start_url,

@@ -2,24 +2,28 @@
 .venv/
 venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
 
-# Local vector database
+# Local vector databases
 chroma_db/
+chroma_db*/
 *.sqlite3
 
-# Environment variables and credentials
+# Models and caches
+models/
+.cache/
+*.gguf
+*.safetensors
+*.bin
+
+# Secrets
 .env
 .env.*
 !.env.example
+*.pem
+*.key
 
-# IDE
-.vscode/
-.idea/
-
-# Logs
+# Local logs and generated outputs
 *.log
-
-# Streamlit secrets
-.streamlit/secrets.toml
+comparison_*.txt

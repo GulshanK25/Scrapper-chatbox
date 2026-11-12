@@ -9,11 +9,17 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from RAG.Vectorstore import VectorStore
 from RAG.generator import Generator
+from RAG.reranker import Reranker
 
 
 NOT_FOUND = "I could not find this information on the website."
+
 MAX_RETRIES = 1
-TOP_K = 8
+TOP_K = 5
+CANDIDATE_K = 50
+RETRIEVAL_K = 30
+
+COLLECTION = "website_chunks_v3"
 
 
 class RAGState(TypedDict):
@@ -30,8 +36,18 @@ class RAGState(TypedDict):
 class RAGGraph:
 
     def __init__(self):
-        self.vector_store = VectorStore()
+        # Use the evaluated V3 collection
+        self.vector_store = VectorStore(
+            collection_name=COLLECTION
+        )
+
+        # Cross-encoder reranker
+        self.reranker = Reranker()
+
+        # Answer generator
         self.generator = Generator()
+
+        # Conversation memory
         self.memory = MemorySaver()
 
         graph = StateGraph(RAGState)
@@ -132,20 +148,41 @@ Latest question:
     # ----------------------------------
 
     def retrieve(self, state):
-        results = self.vector_store.search(
-            state["search_query"],
+        query = state["search_query"]
+        domain = state.get("domain") or None
+
+        # Step 1: Hybrid retrieval
+        # Combines semantic and BM25 keyword search
+        candidates = self.vector_store.hybrid_search(
+            query=query,
+            top_k=RETRIEVAL_K,
+            candidate_k=CANDIDATE_K,
+            domain=domain,
+        )
+
+        # Step 2: Cross-encoder reranking
+        results = self.reranker.rerank(
+            query,
+            candidates,
             top_k=TOP_K,
-            domain=state["domain"],
         )
 
         print("\n--- RETRIEVAL DEBUG ---")
         print("Question:", state["question"])
-        print("Search query:", state["search_query"])
-        print("Chunks retrieved:", len(results))
+        print("Search query:", query)
+        print("Domain:", domain)
+        print("Hybrid candidates:", len(candidates))
+        print("Final chunks:", len(results))
 
         for index, chunk in enumerate(results, start=1):
+            print(f"\nRank {index}")
             print(
-                f"{index}. {chunk.get('source', 'Unknown')}"
+                "Source:",
+                chunk.get("source", "Unknown")
+            )
+            print(
+                "Preview:",
+                chunk.get("text", "")[:350]
             )
 
         print("-----------------------\n")
@@ -302,7 +339,7 @@ Current search query:
     def generate(self, state):
 
         answer = self.generator.generate(
-            state["search_query"],
+            state["question"],
             state["context"],
         )
 

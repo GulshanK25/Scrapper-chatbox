@@ -1,470 +1,278 @@
+"""WAVE: Streamlit interface for the local Website RAG Assistant.
 
-import streamlit as st
+Replace the project's app.py with this file. Run: streamlit run app.py
+"""
+
 from urllib.parse import urlparse
 
-from scrapper.crawler import (
-    iter_website_pages,
-    normalize_url,
-)
+import streamlit as st
+
+from scrapper.crawler import iter_website_pages, normalize_url
 from RAG.chunker import chunk_pages
 from RAG.Vectorstore import VectorStore
 from RAG.graph import RAGGraph
 
-
-# --------------------------------
-# PAGE CONFIGURATION
-# --------------------------------
-
-st.set_page_config(
-    page_title="Website RAG Assistant",
-    page_icon="🔎",
-    layout="centered",
-)
-
-st.title("🔎 Website RAG Assistant")
-
-st.write(
-    "Index website content and chat with it using "
-    "LangGraph, ChromaDB, and locally hosted Llama 3."
-)
-
-
-# --------------------------------
-# CONFIGURATION
-# --------------------------------
-
+COLLECTION = "website_chunks_v3"  # Must match RAG/graph.py
 BATCH_SIZE = 20
 CRAWL_DELAY = 0.5
+NOT_FOUND = "I could not find this information on the website."
 
-NOT_FOUND = (
-    "I could not find this information on the website."
-)
+st.set_page_config(page_title="WAVE | Explore beyond the page", page_icon="🌊", layout="wide", initial_sidebar_state="collapsed")
+
+st.markdown("""
+<style>
+:root {color-scheme:dark;}
+.stApp {background: radial-gradient(ellipse at 85% 0%, #292347 0%, #171626 37%, #131320 76%); color:#f3f0ff;}
+.block-container {max-width: 1020px; padding-top: 1.4rem; padding-bottom: 6rem;}
+[data-testid="stHeader"] {background: transparent;}
+[data-testid="stSidebar"] {background:#201d34;}
+[data-testid="stSidebar"] * {color:#f1edff;}
+[data-testid="stChatMessage"] {background: #242139; border: 1px solid #393451; border-radius:18px; padding:1rem 1.2rem; margin:.7rem 0;}
+[data-testid="stChatMessage"] p {line-height:1.7;}
+[data-testid="stChatInput"] {border-radius:18px; border:1px solid #62568d; background:#28243f;}
+[data-testid="stChatInput"] textarea {color:#f3efff;}
+.stButton > button {border-radius:999px; border:1px solid #49415f; background:#302b49; color:#eee9ff;}
+.stButton > button:hover {border-color:#ac9afa; background:#41365f; color:white;}
+.stButton > button[kind="primary"] {background:#a99af1; color:#1c1732; border-color:#a99af1; font-weight:700;}
+.stButton > button[kind="primary"]:hover {background:#c0b6ff; color:#1c1732;}
+[data-testid="stExpander"] {border:1px solid #423b61; border-radius:14px; background:#25223a;}
+[data-testid="stMetric"] {background:#28243e; padding:.8rem; border-radius:12px;}
+.wave-brand {display:flex; align-items:center; gap:12px; font-size:1.55rem; font-weight:750; letter-spacing:-.06em;}
+.wave-logo {background:#ab9cf2; color:#201936; border-radius:13px; width:42px; height:42px; display:flex; align-items:center; justify-content:center; font-size:1.4rem;}
+.wave-eyebrow {font-size:.75rem; color:#b6a6ef; font-weight:750; letter-spacing:.16em; margin-top:2.2rem;}
+.wave-title {font-size:clamp(2rem,5vw,3.4rem); font-weight:750; letter-spacing:-.055em; line-height:1.14; margin:.65rem 0;}
+.wave-subtitle {color:#bcb4d3; font-size:1.02rem; max-width:620px; line-height:1.65;}
+.wave-section {color:#b9aed9; font-size:.83rem; margin:.8rem 0 .5rem;}
+.wave-footer {color:#807895; font-size:.78rem; text-align:center; margin-top:2.2rem;}
+/* Keep text inputs legible even with light browser theme preferences */
+[data-testid="stTextInput"] input, [data-testid="stNumberInput"] input {border-radius:12px;}
+@media (max-width:640px) {.block-container {padding-left:1rem;padding-right:1rem;} .wave-eyebrow{margin-top:1rem;}}
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_resource
 def load_system():
-    vector_store = VectorStore()
-    rag_graph = RAGGraph()
+    return VectorStore(collection_name=COLLECTION), RAGGraph()
 
-    return vector_store, rag_graph
 
-
-vector_store, rag_graph = load_system()
-
-
-# --------------------------------
-# SESSION STATE
-# --------------------------------
-
-if "conversations" not in st.session_state:
-    st.session_state.conversations = {}
-
-if "thread_ids" not in st.session_state:
-    st.session_state.thread_ids = {}
-
-if "selected_domain" not in st.session_state:
-    st.session_state.selected_domain = None
-
-
-# --------------------------------
-# WEBSITE INDEXING
-# --------------------------------
-
-st.subheader("1. Index a Website")
-
-website_url = st.text_input(
-    "Website URL",
-    placeholder="https://docs.python.org/3/tutorial/",
-)
-
-max_pages = st.number_input(
-    "Maximum pages to index",
-    min_value=1,
-    max_value=10000,
-    value=100,
-    step=50,
-)
-
-
-# --------------------------------
-# CRAWLING MODE
-# --------------------------------
-
-crawl_mode = st.radio(
-    "Crawling Mode",
-    options=[
-        "Current section only",
-        "Entire website",
-    ],
-    index=1,
-    help=(
-        "Current section only indexes pages within "
-        "the starting URL path. Entire website explores "
-        "other permitted sections of the website."
-    ),
-)
-
-crawl_scope = (
-    "website"
-    if crawl_mode == "Entire website"
-    else "section"
-)
-
-st.caption(
-    "Pages are discovered from sitemaps and internal links. "
-    "Choose whether to index the current section or explore "
-    "the wider website. Crawling respects robots.txt."
-)
-
-
-# --------------------------------
-# INDEXING PROCESS
-# --------------------------------
-
-if st.button("Index Website", type="primary"):
-
-    website_url = website_url.strip()
-
-    if not website_url:
-        st.warning("Please enter a website URL.")
-
-    elif not website_url.startswith(
-        ("http://", "https://")
-    ):
-        st.error(
-            "Please enter a valid URL beginning "
-            "with http:// or https://"
-        )
-
-    else:
-
-        progress_bar = st.progress(0)
-        status = st.empty()
-        stats = st.empty()
-
-        pages_processed = 0
-        chunks_processed = 0
-        batch = []
-
-        initial_chunk_count = (
-            vector_store.collection.count()
-        )
-
-        try:
-
-            with st.spinner("Indexing website..."):
-
-                for page in iter_website_pages(
-                    website_url,
-                    max_pages=int(max_pages),
-                    delay=CRAWL_DELAY,
-                    scope=crawl_scope,
-                ):
-
-                    batch.append(page)
-                    pages_processed += 1
-
-                    # Save completed batches
-                    if len(batch) >= BATCH_SIZE:
-
-                        chunks = chunk_pages(batch)
-
-                        if chunks:
-                            vector_store.add_chunks(chunks)
-                            chunks_processed += len(chunks)
-
-                        batch.clear()
-
-                    progress = min(
-                        pages_processed / int(max_pages),
-                        1.0,
-                    )
-
-                    progress_bar.progress(progress)
-
-                    status.info(
-                        f"Processing: {page['url']}"
-                    )
-
-                    stats.write(
-                        f"**Pages processed:** {pages_processed}  "
-                        f"| **Chunks generated:** {chunks_processed}"
-                    )
-
-                # Save remaining pages
-                if batch:
-
-                    chunks = chunk_pages(batch)
-
-                    if chunks:
-                        vector_store.add_chunks(chunks)
-                        chunks_processed += len(chunks)
-
-                    batch.clear()
-
-                # --------------------------------
-                # FINAL INDEXING RESULTS
-                # --------------------------------
-
-                final_chunk_count = (
-                    vector_store.collection.count()
-                )
-
-                chunk_difference = (
-                    final_chunk_count
-                    - initial_chunk_count
-                )
-
-                if pages_processed == 0:
-
-                    st.warning(
-                        "No accessible website pages "
-                        "were found."
-                    )
-
-                else:
-
-                    domain = urlparse(
-                        normalize_url(website_url)
-                    ).netloc.lower()
-
-                    st.session_state[
-                        "selected_domain"
-                    ] = domain
-
-                    progress_bar.progress(1.0)
-
-                    st.success(
-                        "Website indexing completed successfully!"
-                    )
-
-                    st.write(
-                        f"**Crawling mode:** {crawl_mode}"
-                    )
-
-                    st.write(
-                        f"**Pages processed:** {pages_processed}"
-                    )
-
-                    st.write(
-                        f"**Chunks generated:** {chunks_processed}"
-                    )
-
-                    st.write(
-                        f"**New net chunks in ChromaDB:** "
-                        f"{chunk_difference}"
-                    )
-
-                    st.write(
-                        f"**Total chunks stored:** "
-                        f"{final_chunk_count}"
-                    )
-
-                    if (
-                        chunks_processed > 0
-                        and chunk_difference == 0
-                    ):
-                        st.warning(
-                            "Chunks were generated, but the "
-                            "collection count did not increase. "
-                            "Existing records may have been "
-                            "overwritten or deduplicated. "
-                            "Check Vectorstore.py."
-                        )
-
-                    stats.write(
-                        f"**Final result:** "
-                        f"{pages_processed} pages processed, "
-                        f"{chunks_processed} chunks generated."
-                    )
-
-                    status.empty()
-
-        except Exception as error:
-
-            st.error(
-                f"Website indexing failed: {error}"
-            )
-
-            if pages_processed:
-                st.info(
-                    f"{pages_processed} pages were processed "
-                    "before the error. Previously completed "
-                    "batches may already be stored."
-                )
-
-
-# --------------------------------
-# WEBSITE SELECTION
-# --------------------------------
-
-st.divider()
-
-st.subheader("2. Select Website")
-
-domains = vector_store.get_domains()
-
-if not domains:
-
-    st.info(
-        "Index a website above to start chatting."
-    )
-
+try:
+    vector_store, rag_graph = load_system()
+except Exception as error:
+    st.error(f"Unable to start WAVE: {error}")
     st.stop()
 
-
-default_domain = st.session_state.get(
-    "selected_domain"
-)
-
-default_index = (
-    domains.index(default_domain)
-    if default_domain in domains
-    else 0
-)
-
-selected_domain = st.selectbox(
-    "Indexed website",
-    domains,
-    index=default_index,
-)
-
-st.session_state[
-    "selected_domain"
-] = selected_domain
+for key, default in (
+    ("conversations", {}),
+    ("thread_ids", {}),
+    ("selected_domain", None),
+    ("index_result", None),
+):
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 
-# --------------------------------
-# CONVERSATION MANAGEMENT
-# --------------------------------
+def index_website(url: str, max_pages: int, scope: str):
+    """Index in batches and report progress. The percentage is an upper-bound estimate."""
+    url = url.strip()
+    if not url or not url.startswith(("https://", "http://")):
+        st.error("Enter a website URL starting with https:// or http://")
+        return
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        st.error("Enter a valid website address.")
+        return
 
+    progress = st.progress(0, text="Preparing to index...")
+    status = st.empty()
+    pages_processed, chunks_processed = 0, 0
+    batch = []
+    initial_count = vector_store.collection.count()
+    try:
+        for page in iter_website_pages(url, max_pages=max_pages, delay=CRAWL_DELAY, scope=scope):
+            batch.append(page)
+            pages_processed += 1
+            if len(batch) >= BATCH_SIZE:
+                chunks = chunk_pages(batch)
+                if chunks:
+                    vector_store.add_chunks(chunks)
+                    chunks_processed += len(chunks)
+                batch.clear()
+            progress.progress(min(pages_processed / max_pages, 1.0), text=f"Explored {pages_processed} of up to {max_pages} pages")
+            status.caption(f"Current page: {page.get('url', 'Unknown')}")
+
+        if batch:
+            chunks = chunk_pages(batch)
+            if chunks:
+                vector_store.add_chunks(chunks)
+                chunks_processed += len(chunks)
+
+        if not pages_processed:
+            progress.empty()
+            status.empty()
+            st.warning("No accessible pages were found at that address.")
+            return
+
+        domain = urlparse(normalize_url(url)).netloc.lower()
+        st.session_state.selected_domain = domain
+        st.session_state.index_result = {
+            "domain": domain,
+            "pages": pages_processed,
+            "chunks": chunks_processed,
+            "net_new": vector_store.collection.count() - initial_count,
+        }
+        progress.progress(1.0, text="Website ready")
+        status.empty()
+        st.success(f"{domain} is ready to explore!")
+        st.rerun()
+    except Exception as error:
+        st.error(f"Indexing failed: {error}")
+        if pages_processed:
+            st.info(f"{pages_processed} pages were processed before the error. Completed batches may already be saved.")
+
+
+# Header
+header_left, header_right = st.columns([5, 1])
+with header_left:
+    st.markdown('<div class="wave-brand"><span class="wave-logo">≈</span><span>wave</span></div>', unsafe_allow_html=True)
+with header_right:
+    if st.button("＋ Website", use_container_width=True, help="Open the website indexing panel"):
+        st.session_state.show_indexer = not st.session_state.get("show_indexer", False)
+        st.rerun()
+
+# Indexer in a collapsible sidebar, with an inline fallback panel when explicitly requested.
+with st.sidebar:
+    st.title("🌐 Add a website")
+    st.caption("Turn a website into a searchable knowledge space.")
+    with st.form("sidebar_index_form"):
+        sidebar_url = st.text_input("Website URL", placeholder="https://docs.python.org/3/tutorial/")
+        sidebar_pages = st.number_input("Maximum pages", min_value=1, max_value=10000, value=100, step=25)
+        sidebar_mode = st.radio("Crawling scope", ["Entire website", "Current section only"], help="Crawling respects robots.txt.")
+        sidebar_submit = st.form_submit_button("Index website", type="primary", use_container_width=True)
+    if sidebar_submit:
+        index_website(sidebar_url, int(sidebar_pages), "website" if sidebar_mode == "Entire website" else "section")
+    st.divider()
+    st.caption("Local AI · LangGraph · ChromaDB · Ollama")
+
+if st.session_state.get("show_indexer", False):
+    with st.expander("Add a new knowledge space", expanded=True):
+        with st.form("inline_index_form"):
+            website_url = st.text_input("Website URL", placeholder="https://docs.python.org/3/tutorial/")
+            max_pages = st.number_input("Maximum pages to index", min_value=1, max_value=10000, value=100, step=25)
+            crawl_mode = st.radio("Crawling mode", ["Entire website", "Current section only"], horizontal=True)
+            submitted = st.form_submit_button("Start indexing", type="primary")
+        if submitted:
+            index_website(website_url, int(max_pages), "website" if crawl_mode == "Entire website" else "section")
+
+try:
+    domains = vector_store.get_domains()
+except Exception as error:
+    st.error(f"Could not load indexed websites: {error}")
+    st.stop()
+
+if domains:
+    if st.session_state.selected_domain not in domains:
+        st.session_state.selected_domain = domains[0]
+    st.markdown('<div class="wave-section">YOUR SPACES</div>', unsafe_allow_html=True)
+    # Native buttons provide keyboard navigation and a clear selected state.
+    tabs = st.columns(min(len(domains), 4) + 1)
+    for idx, domain in enumerate(domains):
+        # Wrap after every four domains without truncating the list.
+        if idx and idx % 4 == 0:
+            tabs = st.columns(min(len(domains) - idx, 4) + 1)
+        with tabs[idx % 4]:
+            active = domain == st.session_state.selected_domain
+            if st.button(("● " if active else "◦ ") + domain, key=f"domain_{idx}", type="primary" if active else "secondary", use_container_width=True):
+                st.session_state.selected_domain = domain
+                st.rerun()
+else:
+    st.markdown('<div class="wave-eyebrow">YOUR KNOWLEDGE SPACE</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wave-title">Explore beyond the page.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wave-subtitle">Add a website, then ask questions and explore answers grounded in its content.</div>', unsafe_allow_html=True)
+    st.info("No websites indexed yet. Select **＋ Website** above to create your first space.")
+    st.stop()
+
+selected_domain = st.session_state.selected_domain
 if selected_domain not in st.session_state.conversations:
     st.session_state.conversations[selected_domain] = []
-
 if selected_domain not in st.session_state.thread_ids:
-    st.session_state.thread_ids[
-        selected_domain
-    ] = rag_graph.new_thread_id()
+    st.session_state.thread_ids[selected_domain] = rag_graph.new_thread_id()
+messages = st.session_state.conversations[selected_domain]
+thread_id = st.session_state.thread_ids[selected_domain]
+
+if st.session_state.index_result:
+    result = st.session_state.index_result
+    if result["domain"] == selected_domain:
+        st.success(f"Indexed {result['pages']} pages and generated {result['chunks']} chunks. Net new stored chunks: {result['net_new']}.")
+        st.session_state.index_result = None
+
+st.markdown('<div class="wave-eyebrow">EXPLORING ' + selected_domain.replace("<", "&lt;").replace(">", "&gt;") + '</div>', unsafe_allow_html=True)
+if not messages:
+    st.markdown('<div class="wave-title">Curiosity starts here.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="wave-subtitle">Ask anything about this website. Discover answers and trace them back to their sources.</div>', unsafe_allow_html=True)
+else:
+    st.markdown('<div class="wave-title">Follow the conversation.</div>', unsafe_allow_html=True)
+
+control_left, control_right = st.columns([3, 1])
+with control_left:
+    st.caption(f"🌐 {selected_domain} · {len(messages) // 2} answered question(s)")
+with control_right:
+    if st.button("＋ New conversation", use_container_width=True):
+        st.session_state.conversations[selected_domain] = []
+        st.session_state.thread_ids[selected_domain] = rag_graph.new_thread_id()
+        st.rerun()
 
 
-messages = st.session_state.conversations[
-    selected_domain
-]
+def show_sources(sources):
+    if not sources:
+        return
+    with st.expander(f"📖 Explore sources ({len(sources)})"):
+        for idx, source in enumerate(sources, 1):
+            if isinstance(source, str):
+                st.markdown(f"**{idx}.** {source}")
+            elif isinstance(source, dict):
+                url = source.get("source") or source.get("url")
+                if url:
+                    st.markdown(f"**{idx}.** {url}")
+                preview = source.get("text") or source.get("content") or source.get("page_content")
+                if preview:
+                    st.caption(str(preview)[:500])
+            else:
+                st.write(source)
 
-thread_id = st.session_state.thread_ids[
-    selected_domain
-]
-
-
-# --------------------------------
-# CHAT INTERFACE
-# --------------------------------
-
-st.divider()
-
-st.subheader("3. Chat with Website")
-
-st.caption(
-    f"Currently chatting with: {selected_domain}"
-)
-
-
-if st.button("New Conversation"):
-
-    st.session_state.conversations[
-        selected_domain
-    ] = []
-
-    st.session_state.thread_ids[
-        selected_domain
-    ] = rag_graph.new_thread_id()
-
-    st.rerun()
-
-
-# --------------------------------
-# DISPLAY CONVERSATION HISTORY
-# --------------------------------
 
 for message in messages:
-
-    with st.chat_message(message["role"]):
-
+    with st.chat_message(message["role"], avatar="🌊" if message["role"] == "assistant" else "👤"):
         st.markdown(message["content"])
+        if message["role"] == "assistant":
+            show_sources(message.get("sources", []))
 
-        if message.get("sources"):
-
-            with st.expander("Sources"):
-
-                for source in message["sources"]:
-                    st.write(source)
-
-
-# --------------------------------
-# QUESTION ANSWERING
-# --------------------------------
-
-question = st.chat_input(
-    "Ask a question about this website..."
-)
-
-if question:
-
-    messages.append({
-        "role": "user",
-        "content": question,
-    })
-
-    with st.chat_message("user"):
+question = st.chat_input(f"Ask anything about {selected_domain}...")
+if question and question.strip():
+    question = question.strip()
+    messages.append({"role": "user", "content": question})
+    with st.chat_message("user", avatar="👤"):
         st.markdown(question)
-
-    with st.chat_message("assistant"):
-
+    with st.chat_message("assistant", avatar="🌊"):
         try:
-
-            with st.spinner("Thinking..."):
-
-                result = rag_graph.ask(
-                    question=question,
-                    domain=selected_domain,
-                    thread_id=thread_id,
-                )
-
+            with st.spinner("Exploring your sources..."):
+                result = rag_graph.ask(question=question, domain=selected_domain, thread_id=thread_id)
             answer = result["answer"]
             context = result.get("context", [])
-
-            st.markdown(answer)
-
             sources = []
-
-            if (
-                context
-                and NOT_FOUND.lower()
-                not in answer.lower()
-            ):
-
+            seen = set()
+            if context and NOT_FOUND.lower() not in answer.lower():
                 for chunk in context:
-
-                    source = chunk.get("source")
-
-                    if source and source not in sources:
+                    source = chunk.get("source") if isinstance(chunk, dict) else None
+                    if source and source not in seen:
+                        seen.add(source)
                         sources.append(source)
-
-                if sources:
-
-                    with st.expander("Sources"):
-
-                        for source in sources:
-                            st.write(source)
-
-            messages.append({
-                "role": "assistant",
-                "content": answer,
-                "sources": sources,
-            })
-
+            st.markdown(answer)
+            show_sources(sources)
+            messages.append({"role": "assistant", "content": answer, "sources": sources})
         except Exception as error:
+            st.error(f"Could not answer the question: {error}")
+            # Remove the failed user question so UI and graph history do not diverge.
+            messages.pop()
 
-            st.error(
-                f"Question answering failed: {error}"
-            )
+st.markdown('<div class="wave-footer">WAVE · Explore websites with local AI</div>', unsafe_allow_html=True)

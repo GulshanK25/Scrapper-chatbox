@@ -1,0 +1,83 @@
+
+[
+  {
+    "id": "Q01",
+    "question": "What does @classmethod do in Python?",
+    "expected_source": "builtins/functions.html",
+    "expected_phrases": [
+      "A class method receives the class as an implicit first argument"
+    ]
+  },
+  {
+    "id": "Q02",
+    "question": "What does the @staticmethod decorator do?",
+    "expected_source": "builtins/functions.html",
+    "expected_phrases": [
+      "A static method does not receive an implicit first argument"
+    ]
+  },
+  {
+    "id": "Q03",
+    "question": "How do you define a function in Python?",
+    "expected_source": "tutorial/controlflow.html",
+    "expected_phrases": [
+      "The keyword def introduces a function definition"
+    ]
+  },
+  {
+    "id": "Q04",
+    "question": "What is a decorator in Python?",
+    "expected_source": "glossary.html",
+    "expected_phrases": [
+      "decorator"
+    ]
+  },
+  {
+    "id": "Q05",
+    "question": "How are exceptions handled in Python?",
+    "expected_source": "tutorial/errors.html",
+    "expected_phrases": [
+      "except"
+    ]
+  },
+  {
+    "id": "Q06",
+    "question": "What is the difference between lists and tuples?",
+    "expected_source": "tutorial/datastructures.html",
+    "expected_phrases": [
+      "tuple"
+    ]
+  },
+  {
+    "id": "Q07",
+    "question": "What does the len() function do?",
+    "expected_source": "builtins/functions.html",
+    "expected_phrases": [
+      "Return the length"
+    ]
+  },
+  {
+    "id": "Q08",
+    "question": "What is the purpose of the range() function?",
+    "expected_source": "builtins/functions.html",
+    "expected_phrases": [
+      "range"
+    ]
+  },
+  {
+    "id": "Q09",
+    "question": "What is a lambda expression in Python?",
+    "expected_source": "tutorial/controlflow.html",
+    "expected_phrases": [
+      "lambda"
+    ]
+  },
+  {
+    "id": "Q10",
+    "question": "What is a dictionary in Python?",
+    "expected_source": "tutorial/datastructures.html",
+    "expected_phrases": [
+      "dictionary"
+    ]
+  }
+]
